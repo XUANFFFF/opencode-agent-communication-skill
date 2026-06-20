@@ -53,9 +53,87 @@ prompt <session-name> <prompt...>
 history <session-name>
 show <session-name>
 delete <session-name>
+
+build-run <project-dir> --contract <contract.json> -- "<task>"
+build-status <run-id>
+build-cancel <run-id>
+build-review <run-id> --accept|--reject [<reason>]
+takeover <run-id>
 ```
 
 Prompts can be passed as trailing arguments or piped through stdin for long Windows-safe input.
+
+## Build-Run (Supervised Formal Coding)
+
+`build-run` is the single entry point for formal coding tasks. It enforces contract-based agent execution, timeout supervision, modified path allowlisting, and structured build report validation.
+
+### Contract Schema
+
+```json
+{
+  "sessionName": "my-task",
+  "agent": "build",
+  "requireCleanWorktree": true,
+  "allowedPaths": ["src/**", "README.md"],
+  "verification": [
+    {
+      "id": "tests",
+      "command": ["python", "-m", "pytest", "-q"],
+      "timeoutMs": 600000
+    }
+  ],
+  "hardTimeoutMs": 2700000,
+  "idleTimeoutMs": 600000,
+  "terminationGraceMs": 5000,
+  "maxCorrectionRounds": 1
+}
+```
+
+- `command` must be a parameter array (shell: false).
+- `allowedPaths` supports exact paths and `directory/**` glob only.
+
+### Build Report
+
+OpenCode must return a single JSON build report as its final assistant message:
+
+```json
+{
+  "status": "completed",
+  "summary": "Implemented feature X.",
+  "changedFiles": [{ "path": "src/main.js", "action": "modified", "reason": "..." }],
+  "tests": [{ "id": "tests", "command": ["pytest"], "exitCode": 0, "result": "43 passed" }],
+  "incomplete": [],
+  "risks": [],
+  "notes": []
+}
+```
+
+### Run State Machine
+
+```
+created → running → terminating → awaiting_review → accepted
+                     ↓                                ↓
+                 terminating → quarantined         rejected → (correction) → running
+running → aborted (Ctrl+C / cancel)
+awaiting_review → rejected
+awaiting_review → aborted (takeover)
+```
+
+State persists to `$CODEX_HOME/state/opencode-agent-communication/runs/<runId>.json`.
+
+### Formal Coding Rules
+
+- All formal coding must use `build-run`.
+- Do not call `opencode` directly.
+- Do not combine `start` / `prompt` manually for formal coding.
+- When the wrapper fails (timeout, allowlist violation, verification failure), stop and report.
+- While OpenCode is running, Codex must not modify project files.
+- If OpenCode fails, Codex may send one structured correction, or stop and request `takeover`.
+- SSH, SCP, systemctl, database migrations, and production deployment are not part of default `build-run`.
+
+### Wrapper Independent Verification
+
+After OpenCode completes, the wrapper independently runs each `contract.verification` step and cross-validates against the build report and Git status.
 
 ## Before Delegating
 

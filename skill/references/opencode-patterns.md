@@ -151,6 +151,53 @@ node opencode-agent.mjs oneshot plan C:\work\repo @"
 - 第二次仍不合格时，停止重复相似的 `oneshot`。
 - 根据问题类型切换到 `explore`、`general`，或者停止任务并报告阻塞点。
 
+## build-run 正式编码
+
+`build-run` 是正式编码的受监督入口。必须通过 contract JSON 定义 agent、白名单、超时和验证步骤，不可直接调用 `opencode`：
+
+```powershell
+node opencode-agent.mjs build-run C:\work\repo `
+  --contract contract.json `
+  -- "请实现 OCR URL 输入，包含 SSRF 防护和单元测试"
+```
+
+contract.json:
+```json
+{
+  "sessionName": "ocr-url-input",
+  "agent": "build",
+  "requireCleanWorktree": true,
+  "allowedPaths": [
+    "ocr_service/**",
+    "README.md",
+    ".env.example"
+  ],
+  "verification": [
+    {
+      "id": "ocr-tests",
+      "command": ["python", "-m", "pytest", "ocr_service/tests", "-q"],
+      "timeoutMs": 600000
+    }
+  ],
+  "hardTimeoutMs": 2700000,
+  "idleTimeoutMs": 600000,
+  "terminationGraceMs": 5000,
+  "maxCorrectionRounds": 1
+}
+```
+
+运行后状态管理：
+
+```powershell
+node opencode-agent.mjs build-status <run-id>
+node opencode-agent.mjs build-cancel <run-id>
+node opencode-agent.mjs build-review <run-id> --accept
+node opencode-agent.mjs build-review <run-id> --reject --reason "测试覆盖率不足"
+node opencode-agent.mjs takeover <run-id>
+```
+
+Codex 审查阶段只能读取文件、查看 diff、检查测试结果。通过 `build-review --accept` 批准，拒绝时说明原因。拒绝后 OpenCode 可继续修正，或由用户批准 `takeover` 接管。
+
 ## 多轮 session 示例
 
 第一轮：
