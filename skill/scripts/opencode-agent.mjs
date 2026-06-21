@@ -2010,8 +2010,9 @@ async function checkWorkspaceStillness(projectDir) {
 function resolveEffectiveCommand(args) {
   if (!Array.isArray(args) || args.length === 0) return null;
   const cmd0 = args[0].toLowerCase().split(/[/\\]/).pop();
+  const arg1 = args[1] ? String(args[1]).toLowerCase() : "";
 
-  if ((cmd0 === "cmd.exe" || cmd0 === "cmd") && args[1] === "/c") {
+  if ((cmd0 === "cmd.exe" || cmd0 === "cmd") && arg1 === "/c") {
     const rest = args.slice(2);
     if (rest.length > 0) {
       const firstToken = String(rest[0]).trim().split(/\s+/)[0].toLowerCase();
@@ -2021,7 +2022,7 @@ function resolveEffectiveCommand(args) {
   }
 
   if ((cmd0 === "powershell" || cmd0 === "pwsh") &&
-      (args[1] === "-Command" || args[1] === "-c" || args[1] === "/c")) {
+      (arg1 === "-command" || arg1 === "-c" || arg1 === "/c")) {
     const rest = args.slice(2);
     if (rest.length > 0) {
       const firstToken = String(rest[0]).trim().split(/\s+/)[0].toLowerCase();
@@ -2040,7 +2041,20 @@ function resolveEffectiveCommand(args) {
   }
 
   if ((cmd0 === "npx" || cmd0 === "npx.cmd") && args.length >= 2) {
-    return resolveEffectiveCommand(args.slice(1));
+    // Skip common npx flags before the actual command
+    let i = 1;
+    while (i < args.length) {
+      const a = args[i];
+      if (a === "--yes" || a === "-y") {
+        i++;
+      } else if (a === "--package" || a === "-p" || a === "--call" || a === "-c") {
+        i += 2;
+      } else {
+        break;
+      }
+    }
+    if (i >= args.length) return "npx";
+    return resolveEffectiveCommand(args.slice(i));
   }
 
   return cmd0;

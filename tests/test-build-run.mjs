@@ -830,18 +830,27 @@ try {
 }
 assert(reviewBlocked, "build-review rejects non-awaiting_review phase");
 
-suite("resolveEffectiveCommand");
+suite("resolveEffectiveCommand: shell wrapper unrolling, npx flag skipping, case insensitivity");
 
 assert(resolveEffectiveCommand(["echo", "hello"]) === "echo", "simple command");
 assert(resolveEffectiveCommand(["ssh", "user@host"]) === "ssh", "ssh directly blocked");
 assert(resolveEffectiveCommand(["cmd.exe", "/c", "vercel", "deploy"]) === "vercel", "cmd.exe /c vercel deploy");
 assert(resolveEffectiveCommand(["cmd", "/c", "ssh", "user@host"]) === "ssh", "cmd /c ssh");
 assert(resolveEffectiveCommand(["powershell", "-Command", "ssh", "user@host"]) === "ssh", "powershell -Command ssh");
-assert(resolveEffectiveCommand(["pwsh", "-c", "kubectl", "get", "pods"]) === "kubectl", "pwsh -c kubectl");
+assert(resolveEffectiveCommand(["pwsh", "-c", "kubectl", "get", "pods"]) === "kubectl", "pwsh -c lowercase");
+assert(resolveEffectiveCommand(["cmd.exe", "/C", "ssh", "user@host"]) === "ssh", "cmd.exe /C uppercase");
+assert(resolveEffectiveCommand(["cmd", "/C", "vercel", "deploy"]) === "vercel", "cmd /C uppercase");
+assert(resolveEffectiveCommand(["powershell", "-command", "ssh", "user@host"]) === "ssh", "powershell -command lowercase");
+assert(resolveEffectiveCommand(["pwsh", "-Command", "kubectl", "get", "pods"]) === "kubectl", "pwsh -Command PascalCase");
 assert(resolveEffectiveCommand(["sh", "-c", "docker", "ps"]) === "docker", "sh -c docker");
 assert(resolveEffectiveCommand(["bash", "-c", "systemctl", "restart", "nginx"]) === "systemctl", "bash -c systemctl");
 assert(resolveEffectiveCommand(["npx", "vercel", "deploy"]) === "vercel", "npx vercel deploy");
 assert(resolveEffectiveCommand(["npx.cmd", "terraform", "apply"]) === "terraform", "npx.cmd terraform");
+assert(resolveEffectiveCommand(["npx", "--yes", "vercel", "deploy"]) === "vercel", "npx --yes vercel");
+assert(resolveEffectiveCommand(["npx", "-y", "terraform", "apply"]) === "terraform", "npx -y terraform");
+assert(resolveEffectiveCommand(["npx", "--package", "some", "vercel"]) === "vercel", "npx --package pkg vercel");
+assert(resolveEffectiveCommand(["npx", "-p", "some", "ssh"]) === "ssh", "npx -p pkg ssh");
+assert(resolveEffectiveCommand(["npx", "--call", "terraform"]) === "npx", "npx --call consumes call string");
 assert(resolveEffectiveCommand(["cmd.exe", "/c", "echo", "hello"]) === "echo", "cmd.exe /c echo allowed cmd");
 assert(resolveEffectiveCommand([]) === null, "empty args returns null");
 assert(resolveEffectiveCommand(null) === null, "null args returns null");
@@ -968,7 +977,7 @@ assert(activeNotBlocked, "non-quarantined run does not block");
 // Cleanup
 await fs.rm(qScanDir, { recursive: true, force: true });
 
-suite("Denylist shell wrapper detection via validateContract");
+suite("Denylist via validateContract: shell wrappers, case insensitivity, npx flags");
 
 assertThrows(() => validateContract({
   sessionName: "t", agent: "build", allowedPaths: ["src/**"],
@@ -993,6 +1002,36 @@ assertThrows(() => validateContract({
   verification: [{ id: "b4", command: ["npx", "vercel", "deploy"] }],
   hardTimeoutMs: 60000,
 }), "CONTRACT_SCHEMA_INVALID", "npx vercel deploy blocked");
+
+assertThrows(() => validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "b5", command: ["npx", "--yes", "vercel", "deploy"] }],
+  hardTimeoutMs: 60000,
+}), "CONTRACT_SCHEMA_INVALID", "npx --yes vercel blocked");
+
+assertThrows(() => validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "b6", command: ["npx", "-y", "terraform", "apply"] }],
+  hardTimeoutMs: 60000,
+}), "CONTRACT_SCHEMA_INVALID", "npx -y terraform blocked");
+
+assertThrows(() => validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "b7", command: ["cmd.exe", "/C", "vercel", "deploy"] }],
+  hardTimeoutMs: 60000,
+}), "CONTRACT_SCHEMA_INVALID", "cmd.exe /C uppercase blocked");
+
+assertThrows(() => validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "b8", command: ["powershell", "-command", "ssh", "user@host"] }],
+  hardTimeoutMs: 60000,
+}), "CONTRACT_SCHEMA_INVALID", "powershell -command lowercase blocked");
+
+assertThrows(() => validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "b9", command: ["pwsh", "-Command", "kubectl", "get", "pods"] }],
+  hardTimeoutMs: 60000,
+}), "CONTRACT_SCHEMA_INVALID", "pwsh -Command PascalCase blocked");
 
 // allowExternalSideEffects bypasses all shell wrapper detection
 const bypassContractShell = validateContract({
