@@ -198,6 +198,12 @@ node opencode-agent.mjs takeover <run-id>
 
 Codex 审查阶段只能读取文件、查看 diff、检查测试结果。通过 `build-review --accept` 批准，拒绝时说明原因。拒绝后 OpenCode 可继续修正，或由用户批准 `takeover` 接管。
 
+### 安全约束
+
+验证命令默认拒绝高风险命令（ssh、scp、systemctl、kubectl、docker、terraform、ansible、mysql 等），除非 contract 显式设置 `"allowExternalSideEffects": true`。
+
+被隔离的 run（超时后工作区不稳定）无法被 `build-cancel`、无法进入纠偏轮次、无法被同名 `build-run` 覆盖。只能通过 `takeover` 接管。不能使用 `start` / `prompt` 操作 build session。
+
 ## 多轮 session 示例
 
 第一轮：

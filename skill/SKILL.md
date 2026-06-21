@@ -121,15 +121,53 @@ awaiting_review → aborted (takeover)
 
 State persists to `$CODEX_HOME/state/opencode-agent-communication/runs/<runId>.json`.
 
+### Contract-Generated Agent Instruction
+
+The wrapper automatically prepends a structured system instruction to every build-run task prompt. This instruction includes:
+
+- Allowed paths (from contract.allowedPaths)
+- Required JSON build report schema
+- Verification commands that must pass
+- Explicit forbidden actions (deploy, SSH, systemctl, kubectl, docker, terraform, ansible, database migration, git push/commit, --dangerously-skip-permissions)
+
+The agent receives the wrapped prompt, not the raw user prompt. This prevents prompt injection from omitting the build report schema or forbidden actions.
+
+### Verification Command Safety
+
+Verification commands have a built-in denylist that rejects high-risk commands by default:
+
+```text
+ssh, scp, sftp, systemctl, kubectl, helm, docker, docker-compose,
+terraform, pulumi, ansible, mysql, psql, pg_dump, mongosh, redis-cli,
+flyctl, railway, netlify, vercel
+```
+
+To allow these, set `"allowExternalSideEffects": true` in the contract. This must be an explicit opt-in.
+
+### Quarantine Isolation
+
+A quarantined run (timeout with unstable workspace, or untracked subprocess) is isolated at multiple levels:
+
+- `build-run` with the same `sessionName` as a quarantined run is blocked.
+- `build-cancel` rejects quarantined runs (use `takeover` instead).
+- `build-review` only works in `awaiting_review` phase, which quarantined runs never enter.
+- Correction rounds are blocked for quarantined runs.
+- `opencodeResumeAllowed` is set to `false`, preventing old `prompt`/`start` commands from resuming build sessions.
+
+### Build Session Isolation
+
+Build sessions use unique run IDs and separate state (`runs/<runId>.json`). The old `start` / `prompt` / `history` / `show` / `delete` commands operate on a different state file (`sessions.json`) and cannot access build run state. Do not use `start` / `prompt` for formal coding tasks; always use `build-run`.
+
 ### Formal Coding Rules
 
 - All formal coding must use `build-run`.
 - Do not call `opencode` directly.
 - Do not combine `start` / `prompt` manually for formal coding.
-- When the wrapper fails (timeout, allowlist violation, verification failure), stop and report.
+- When the wrapper fails (timeout, allowlist violation, verification failure, quarantine), stop and report.
 - While OpenCode is running, Codex must not modify project files.
 - If OpenCode fails, Codex may send one structured correction, or stop and request `takeover`.
 - SSH, SCP, systemctl, database migrations, and production deployment are not part of default `build-run`.
+- Verification commands default-deny high-risk deployment and infrastructure commands unless `allowExternalSideEffects` is explicitly set.
 
 ### Wrapper Independent Verification
 

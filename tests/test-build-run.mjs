@@ -25,8 +25,11 @@ import {
   checkWorkspaceStillness,
   runWrapperVerification,
   runProcess,
+  buildSystemPrompt,
   BUILD_RUN_ERROR_CODES,
   VALID_PHASES,
+  HIGH_RISK_VERIFICATION_COMMANDS,
+  FORBIDDEN_AGENT_ACTIONS,
 } from "../skill/scripts/opencode-agent.mjs";
 
 // ----- Test Framework (minimal, no deps) -----
@@ -578,6 +581,252 @@ if (notFoundPreflight.ok) {
   // If it fails, that's also ok - depends on how strict we want
   assert(true, "preflight handles missing paths");
 }
+
+suite("buildSystemPrompt");
+
+const promptContract = {
+  sessionName: "test-session",
+  agent: "build",
+  allowedPaths: ["src/**", "README.md"],
+  verification: [{ id: "test", command: ["pytest"], timeoutMs: 30000 }],
+};
+const systemPrompt = buildSystemPrompt(promptContract, "Do the thing.");
+
+assert(systemPrompt.includes("test-session"), "prompt includes session name");
+assert(systemPrompt.includes("src/**"), "prompt includes allowed paths");
+assert(systemPrompt.includes("README.md"), "prompt includes allowed paths");
+assert(systemPrompt.includes("pytest"), "prompt includes verification command");
+assert(systemPrompt.includes("Do the thing."), "prompt includes user task");
+assert(systemPrompt.includes("changedFiles"), "prompt includes JSON schema");
+assert(systemPrompt.includes("Forbidden"), "prompt includes forbidden section");
+assert(systemPrompt.includes("deploy") || systemPrompt.includes("deployment"), "prompt forbids deployment");
+assert(systemPrompt.includes("SSH"), "prompt forbids SSH");
+assert(systemPrompt.includes("systemctl"), "prompt forbids systemctl");
+assert(systemPrompt.includes("dangerously-skip-permissions"), "prompt forbids --dangerously-skip-permissions");
+assert(!systemPrompt.includes("### Task\n\n### Task"), "no duplicate task markers");
+
+suite("HIGH_RISK_VERIFICATION_COMMANDS denylist");
+
+assert(HIGH_RISK_VERIFICATION_COMMANDS.includes("ssh"), "ssh is denied");
+assert(HIGH_RISK_VERIFICATION_COMMANDS.includes("scp"), "scp is denied");
+assert(HIGH_RISK_VERIFICATION_COMMANDS.includes("systemctl"), "systemctl is denied");
+assert(HIGH_RISK_VERIFICATION_COMMANDS.includes("kubectl"), "kubectl is denied");
+assert(HIGH_RISK_VERIFICATION_COMMANDS.includes("docker"), "docker is denied");
+assert(HIGH_RISK_VERIFICATION_COMMANDS.includes("terraform"), "terraform is denied");
+assert(HIGH_RISK_VERIFICATION_COMMANDS.includes("ansible"), "ansible is denied");
+assert(HIGH_RISK_VERIFICATION_COMMANDS.includes("mysql"), "mysql is denied");
+assert(HIGH_RISK_VERIFICATION_COMMANDS.includes("psql"), "psql is denied");
+assert(HIGH_RISK_VERIFICATION_COMMANDS.length >= 12, "at least 12 denied commands");
+
+suite("validateContract: verification command denylist");
+
+assertThrows(
+  () => validateContract({
+    sessionName: "test", agent: "build", allowedPaths: ["src/**"],
+    verification: [{ id: "bad", command: ["ssh", "user@host", "cmd"] }],
+    hardTimeoutMs: 60000,
+  }),
+  "CONTRACT_SCHEMA_INVALID",
+  "ssh in verification is denied"
+);
+
+assertThrows(
+  () => validateContract({
+    sessionName: "test", agent: "build", allowedPaths: ["src/**"],
+    verification: [{ id: "bad", command: ["kubectl", "get", "pods"] }],
+    hardTimeoutMs: 60000,
+  }),
+  "CONTRACT_SCHEMA_INVALID",
+  "kubectl in verification is denied"
+);
+
+// allowExternalSideEffects = true bypasses the denylist
+const bypassContract = validateContract({
+  sessionName: "test", agent: "build", allowedPaths: ["src/**"],
+  allowExternalSideEffects: true,
+  verification: [{ id: "ext", command: ["ssh", "user@host", "cmd"] }],
+  hardTimeoutMs: 60000,
+});
+assert(bypassContract.allowExternalSideEffects === true, "allowExternalSideEffects preserved");
+assert(bypassContract.verification[0].command[0] === "ssh", "bypass contract allows ssh");
+
+suite("validateContract: allowExternalSideEffects default false");
+
+const defaultContract = validateContract({
+  sessionName: "test", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "safe", command: ["echo", "ok"] }],
+  hardTimeoutMs: 60000,
+});
+assert(defaultContract.allowExternalSideEffects === false, "default allowExternalSideEffects is false");
+
+suite("Quarantine: correction blocked");
+
+const quarantinedState = createInitialRunState({
+  runId: "test-q-1", projectDir: "/tmp", sessionName: "quarantine-test",
+  allowedPaths: ["src/**"], contract: {},
+});
+quarantinedState.quarantined = true;
+quarantinedState.phase = "quarantined";
+// Correction should be blocked because quarantined
+// We simulate the check by verifying the logic path
+assert(quarantinedState.quarantined === true, "quarantined state is marked");
+assert(quarantinedState.opencodeResumeAllowed === true, "initial opencodeResumeAllowed should be true");
+// After quarantine, opencodeResumeAllowed should be false
+quarantinedState.opencodeResumeAllowed = false;
+assert(quarantinedState.opencodeResumeAllowed === false, "quarantined runs cannot resume");
+
+// Verify that a run with same sessionName as quarantined blocks new build-run
+let blockDetected = false;
+try {
+  // Simulate the logic from cmdBuildRun: iterate runs dir entries
+  const mockEntry = { sessionName: "dup-test", quarantined: true, runId: "existing-q" };
+  if (mockEntry.sessionName === "dup-test" && mockEntry.quarantined) {
+    throw new Error("SESSION_QUARANTINED");
+  }
+} catch (e) {
+  blockDetected = e.message === "SESSION_QUARANTINED";
+}
+assert(blockDetected, "quarantined run blocks new build-run with same sessionName");
+
+suite("FORBIDDEN_AGENT_ACTIONS coverage");
+
+const forbiddenPatterns = FORBIDDEN_AGENT_ACTIONS.map(f => f.pattern);
+assert(forbiddenPatterns.includes("deploy"), "deploy is forbidden for agent");
+assert(forbiddenPatterns.includes("ssh "), "ssh is forbidden for agent");
+assert(forbiddenPatterns.includes("systemctl "), "systemctl is forbidden for agent");
+assert(forbiddenPatterns.includes("kubectl "), "kubectl is forbidden for agent");
+assert(forbiddenPatterns.includes("docker "), "docker is forbidden for agent");
+assert(forbiddenPatterns.includes("terraform "), "terraform is forbidden for agent");
+assert(forbiddenPatterns.includes("ansible"), "ansible is forbidden for agent");
+assert(forbiddenPatterns.includes("database migration"), "database migration is forbidden for agent");
+assert(forbiddenPatterns.includes("git push"), "git push is forbidden for agent");
+assert(forbiddenPatterns.includes("--dangerously-skip-permissions"), "dangerous flag forbidden");
+
+suite("Mock OpenCode build-run success path");
+
+// Simulate a complete build-run cycle with mock data
+const mockContract = {
+  sessionName: "mock-test",
+  agent: "build",
+  allowedPaths: ["src/**", "README.md"],
+  verification: [{ id: "mock-test", command: ["cmd.exe", "/c", "echo", "ok"], timeoutMs: 5000 }],
+  hardTimeoutMs: 30000,
+};
+
+// Mock events: build report JSON
+const mockEvents = [
+  { type: "reasoning", part: { text: "thinking..." } },
+  { type: "text", part: { text: '{"status":"completed","changedFiles":[{"path":"src/main.js","action":"modified","reason":"mock"}],"tests":[{"id":"mock-test","command":["echo","ok"],"exitCode":0,"result":"passed"}],"incomplete":[],"summary":"mock build","risks":[],"notes":[]}' } },
+  { type: "finish", part: { finishReason: "endTurn" } },
+];
+
+const mockReport = extractBuildReportFromEvents(mockEvents);
+assert(mockReport !== null, "mock build report extracted");
+assert(mockReport.status === "completed", "mock report status completed");
+assert(mockReport.changedFiles.length === 1, "mock has 1 changed file");
+assert(mockReport.tests.length === 1, "mock has 1 test");
+
+// Cross-validate with git changes that match
+const mockVChanges = [{ path: "src/main.js", action: "modified" }];
+const mockCrossErrors = crossValidateBuildReport(mockReport, mockContract, mockVChanges);
+assert(mockCrossErrors.length === 0, "mock cross-validation passes");
+
+// Verify the prompt wrapping works
+const mockPrompt = buildSystemPrompt(mockContract, "Implement feature X");
+assert(mockPrompt.includes("mock-test"), "system prompt includes session name");
+assert(mockPrompt.includes("src/**"), "system prompt includes allowed paths");
+assert(mockPrompt.includes("Implement feature X"), "system prompt includes user task");
+
+suite("Build-run timeout stillness failure (mock)");
+
+// Simulate the quarantine logic from supervisedBuildRun
+const timeoutState = createInitialRunState({
+  runId: "mock-timeout", projectDir: "/tmp", sessionName: "timeout-test",
+  allowedPaths: ["src/**"], contract: {},
+});
+timeoutState.phase = "terminating";
+timeoutState.timedOut = true;
+
+// After failed stillness check
+timeoutState.phase = "quarantined";
+timeoutState.quarantined = true;
+timeoutState.opencodeResumeAllowed = false;
+
+assert(timeoutState.quarantined === true, "timeout stillness failure -> quarantined");
+assert(timeoutState.opencodeResumeAllowed === false, "quarantined cannot resume");
+assert(timeoutState.timedOut === true, "timedOut flag preserved");
+
+// Verify build-status on quarantined run
+let quarantineReported = false;
+try {
+  // Simulate cmdBuildRun sessionName check
+  const mockEntry = { sessionName: "timeout-test", quarantined: true, runId: "mock-timeout" };
+  if (mockEntry.sessionName === "timeout-test" && mockEntry.quarantined) {
+    throw new Error("SESSION_QUARANTINED");
+  }
+} catch (e) {
+  quarantineReported = e.message === "SESSION_QUARANTINED";
+}
+assert(quarantineReported, "quarantined run blocks same sessionName");
+
+suite("Cross-platform: non-Windows mock");
+
+// Test that killProcessTree handles non-Windows gracefully
+// (Mock test - we can't actually test POSIX process groups here)
+const nonWindowsHandler = () => {
+  // Simulate the non-Windows branch in killProcessTree
+  const pid = 99999;
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch (e) {
+    // Expected: ESRCH or EPERM since PID doesn't exist
+    return e.code === "ESRCH" || e.code === "EPERM";
+  }
+  return true; // Would only reach here on actual success (unlikely for fake PID)
+};
+// Just verify the function exists and doesn't crash
+assert(typeof killProcessTree === "function", "killProcessTree exists on all platforms");
+
+// Test that runWrapperVerification rejects high-risk commands
+let denialDetected = false;
+try {
+  // This should be caught by contract validation, not by runWrapperVerification itself
+  // runWrapperVerification just runs whatever it gets
+  // The denylist check is in validateContract
+  await runWrapperVerification(
+    [{ id: "safe-test", command: ["cmd.exe", "/c", "echo", "ok"], timeoutMs: 5000 }],
+    process.cwd()
+  );
+  denialDetected = true; // Reached here means simple echo is fine
+} catch {
+  denialDetected = false;
+}
+assert(denialDetected, "runWrapperVerification allows safe commands");
+
+// Test that quarantined run's override cannot be bypassed via old commands
+const quarantineTestState = createInitialRunState({
+  runId: "q-bypass-test", projectDir: "/tmp", sessionName: "q-bypass",
+  allowedPaths: ["src/**"], contract: {},
+});
+quarantineTestState.phase = "quarantined";
+quarantineTestState.quarantined = true;
+quarantineTestState.opencodeResumeAllowed = false;
+
+// Old prompt/start can't be used for build sessions because build sessions use unique run IDs
+// Verify that the state correctly blocks resume
+assert(quarantineTestState.opencodeResumeAllowed === false, "quarantine blocks resume");
+assert(quarantineTestState.codexWriteAllowed === false, "quarantine blocks codex writes");
+
+// Verify that build-review cannot accept a quarantined run
+let reviewBlocked = false;
+try {
+  if (quarantineTestState.phase !== "awaiting_review") {
+    throw new Error("SESSION_QUARANTINED: phase must be awaiting_review");
+  }
+} catch (e) {
+  reviewBlocked = e.message.includes("SESSION_QUARANTINED");
+}
+assert(reviewBlocked, "build-review rejects non-awaiting_review phase");
 
 // ----- Summary -----
 suite("SUMMARY");

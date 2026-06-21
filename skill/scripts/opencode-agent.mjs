@@ -51,6 +51,31 @@ const STILLNESS_INTERVAL_MS = 2000;
 const STILLNESS_MAX_WAIT_MS = 30000;
 const STILLNESS_REQUIRED_SNAPSHOTS = 3;
 
+const HIGH_RISK_VERIFICATION_COMMANDS = [
+  "ssh", "scp", "sftp", "systemctl", "kubectl", "helm",
+  "docker", "docker-compose", "nerdctl", "podman-compose",
+  "terraform", "pulumi", "ansible", "ansible-playbook",
+  "mysql", "psql", "pg_dump", "pg_restore", "mongosh", "redis-cli",
+  "flyctl", "railway", "netlify", "vercel",
+];
+
+const FORBIDDEN_AGENT_ACTIONS = [
+  { pattern: "deploy", description: "deployment" },
+  { pattern: "publish", description: "publication" },
+  { pattern: "ssh ", description: "SSH connection" },
+  { pattern: "scp ", description: "SCP transfer" },
+  { pattern: "systemctl ", description: "systemd service management" },
+  { pattern: "kubectl ", description: "Kubernetes management" },
+  { pattern: "helm ", description: "Helm chart management" },
+  { pattern: "docker ", description: "Docker operations" },
+  { pattern: "terraform ", description: "Terraform operations" },
+  { pattern: "ansible", description: "Ansible operations" },
+  { pattern: "database migration", description: "database migration" },
+  { pattern: "git push", description: "remote git push" },
+  { pattern: "git commit", description: "git commit (only wrapper commits)" },
+  { pattern: "--dangerously-skip-permissions", description: "dangerous permission bypass" },
+];
+
 class UsageError extends Error {
   constructor(message) {
     super(message);
@@ -2025,6 +2050,8 @@ function validateContract(value) {
     });
   }
 
+  const allowExternalSideEffects = value.allowExternalSideEffects === true;
+
   for (const step of value.verification) {
     if (typeof step.id !== "string" || !step.id.trim()) {
       throw buildJsonErrorResponse({
@@ -2040,6 +2067,18 @@ function validateContract(value) {
         message: `Each verification step must have a command array: ${step.id}`,
         stepId: step.id,
       });
+    }
+    if (!allowExternalSideEffects) {
+      const baseCmd = step.command[0].toLowerCase().split(/[/\\]/).pop();
+      if (HIGH_RISK_VERIFICATION_COMMANDS.includes(baseCmd)) {
+        throw buildJsonErrorResponse({
+          errorCode: "CONTRACT_SCHEMA_INVALID",
+          exitCode: 2,
+          message: `Verification command '${baseCmd}' is not allowed. Set "allowExternalSideEffects": true in contract to enable it.`,
+          stepId: step.id,
+          command: baseCmd,
+        });
+      }
     }
   }
 
@@ -2057,6 +2096,7 @@ function validateContract(value) {
     requireCleanWorktree: value.requireCleanWorktree !== false,
     allowedPaths: value.allowedPaths,
     verification: value.verification,
+    allowExternalSideEffects,
     hardTimeoutMs: value.hardTimeoutMs,
     idleTimeoutMs: value.idleTimeoutMs ?? 600000,
     terminationGraceMs: value.terminationGraceMs ?? 5000,
@@ -2208,6 +2248,59 @@ function crossValidateBuildReport(report, contract, gitChanges) {
   }
 
   return errors;
+}
+
+// ----- build-run: system prompt builder -----
+function buildSystemPrompt(contract, userPrompt) {
+  const allowedList = contract.allowedPaths.map((p) => `  - ${p}`).join("\n");
+  const verificationList = contract.verification.map((v) =>
+    `  - "${v.id}": \`${v.command.join(" ")}\``
+  ).join("\n");
+  const forbiddenList = FORBIDDEN_AGENT_ACTIONS.map((f) =>
+    `  - Do not run ${f.description} commands (${f.pattern}).`
+  ).join("\n");
+
+  return `You are the OpenCode build agent for session "${contract.sessionName}".
+
+## Scope
+You may only modify files within these allowed paths:
+${allowedList}
+
+Any change outside these paths will be rejected.
+
+## Required Output
+After completing the task, return exactly one JSON object as your final message (no Markdown fences, no other text after it):
+{
+  "status": "completed" | "blocked" | "failed",
+  "summary": "Short summary of what was done.",
+  "changedFiles": [
+    { "path": "relative/path", "action": "added|modified|deleted", "reason": "Why this change was needed." }
+  ],
+  "tests": [
+    { "id": "<verification-id>", "command": ["<cmd>", ...], "exitCode": 0, "result": "X passed / Y failed" }
+  ],
+  "incomplete": [],
+  "risks": ["Any risks or concerns"],
+  "notes": ["Any additional notes"]
+}
+
+## Verification
+The following verification steps must pass (exitCode 0) for the build to be accepted:
+${verificationList}
+
+If any test fails, set status to "failed" and explain what failed.
+
+## Forbidden Actions
+${forbiddenList}
+  - Do not publish, deploy, transact, or bypass permissions.
+  - Do not read secrets, auth tokens, or unrelated files.
+  - Do not claim tests passed unless they actually ran.
+  - Do not use --dangerously-skip-permissions.
+  - Do not modify files outside allowedPaths.
+  - Do not commit or push changes.
+
+## Task
+${userPrompt}`;
 }
 
 // ----- build-run: wrapper verification runner -----
@@ -2470,6 +2563,18 @@ async function processBuildRunCompletion(events, runState, contract, projectDir,
       message: `Wrapper verification failed for: ${wrapperFailures.map((f) => f.id).join(", ")}`,
     };
 
+    if (runState.quarantined) {
+      runState.phase = "quarantined";
+      runState.opencodeResumeAllowed = false;
+      await saveRun(runState);
+      throw buildJsonErrorResponse({
+        errorCode: "SESSION_QUARANTINED",
+        exitCode: 8,
+        runId: runState.runId,
+        message: "Quarantined run cannot enter correction. Start a new build-run.",
+      });
+    }
+
     if (runState.correctionRounds < contract.maxCorrectionRounds) {
       runState.correctionRounds++;
       runState.phase = "running";
@@ -2551,6 +2656,31 @@ async function cmdBuildRun(projectDir, tailArgs) {
   const contractRaw = await fs.readFile(path.resolve(contractPath), "utf8");
   const contract = validateContract(JSON.parse(contractRaw));
 
+  // Block if an existing quarantined run with same sessionName exists
+  const runsDir = getRunStateDir();
+  let existingRunDirEntries;
+  try {
+    existingRunDirEntries = await fs.readdir(runsDir);
+  } catch {
+    existingRunDirEntries = [];
+  }
+  for (const entry of existingRunDirEntries) {
+    if (!entry.endsWith(".json")) continue;
+    try {
+      const existingRaw = await fs.readFile(path.join(runsDir, entry), "utf8");
+      const existing = JSON.parse(existingRaw);
+      if (existing.sessionName === contract.sessionName && existing.quarantined) {
+        throw buildJsonErrorResponse({
+          errorCode: "SESSION_QUARANTINED",
+          exitCode: 4,
+          existingRunId: existing.runId,
+          sessionName: contract.sessionName,
+          message: `Session '${contract.sessionName}' has a quarantined run (${existing.runId}). Create a new sessionName or resolve the quarantine first.`,
+        });
+      }
+    } catch { /* skip unreadable entries */ }
+  }
+
   if (contract.requireCleanWorktree) {
     const statusResult = await runProcess("git", ["status", "--porcelain=v1", "-z"], {
       cwd, timeoutMs: 15000,
@@ -2575,14 +2705,15 @@ async function cmdBuildRun(projectDir, tailArgs) {
   runState.phase = "created";
   await saveRun(runState);
 
-  const taskPrompt = await readPrompt(promptParts);
+  const rawPrompt = await readPrompt(promptParts);
+  const systemPrompt = buildSystemPrompt(contract, rawPrompt);
   const title = buildUniqueTitle(`br-${sessionName}`);
 
   const before = await sessionList();
   const opencodeArgs = buildRunArgs({
     agent: contract.agent,
     cwd,
-    prompt: taskPrompt,
+    prompt: systemPrompt,
     title,
     files: [],
   });
@@ -2657,6 +2788,15 @@ async function cmdBuildStatus(runId) {
 // ----- build-run: cancel command -----
 async function cmdBuildCancel(runId) {
   const runState = await loadRun(runId);
+  if (runState.quarantined) {
+    throw buildJsonErrorResponse({
+      errorCode: "SESSION_QUARANTINED",
+      exitCode: 4,
+      runId,
+      phase: runState.phase,
+      message: `Cannot cancel a quarantined build (${runId}). Use takeover to abort.`,
+    });
+  }
   if (!["created", "running", "terminating"].includes(runState.phase)) {
     throw buildJsonErrorResponse({
       errorCode: "SESSION_QUARANTINED",
@@ -2877,6 +3017,7 @@ export {
   checkWorkspaceStillness,
   runWrapperVerification,
   buildRunArgs,
+  buildSystemPrompt,
   parseNdjson,
   extractFinalAssistantMessage,
   extractSessionIdFromEvents,
@@ -2886,6 +3027,8 @@ export {
   BUILD_RUN_ERROR_CODES,
   VALID_PHASES,
   VALID_BUILD_STATUSES,
+  HIGH_RISK_VERIFICATION_COMMANDS,
+  FORBIDDEN_AGENT_ACTIONS,
 };
 
 main(process.argv.slice(2)).catch((error) => {
