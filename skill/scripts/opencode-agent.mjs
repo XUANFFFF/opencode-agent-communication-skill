@@ -1953,6 +1953,37 @@ async function waitForProcessExit(pid, timeoutMs = 10000) {
   return false;
 }
 
+// ----- build-run: deep workspace snapshot -----
+async function buildDeepSnapshot(projectDir) {
+  const statusResult = await runProcess("git", ["status", "--porcelain=v1", "-z"], {
+    cwd: projectDir, timeoutMs: 10000,
+  });
+  const parts = [statusResult.stdout];
+
+  const entries = statusResult.stdout.split("\0").filter(Boolean);
+  for (const entry of entries) {
+    if (entry.length < 4) continue;
+    const pathPart = entry.slice(3).trim();
+    if (!pathPart) continue;
+    try {
+      const fullPath = path.resolve(projectDir, pathPart);
+      const stat = await fs.stat(fullPath);
+      parts.push(`${pathPart}:size=${stat.size}:mtime=${stat.mtimeMs}`);
+      if (stat.size > 0) {
+        const fd = await fs.open(fullPath, "r");
+        const buf = Buffer.alloc(Math.min(stat.size, 120));
+        await fd.read(buf, 0, buf.length, 0);
+        await fd.close();
+        parts.push(`hash:${buf.toString("hex")}`);
+      }
+    } catch {
+      parts.push(`${pathPart}:deleted`);
+    }
+  }
+
+  return parts.join("|");
+}
+
 // ----- build-run: workspace stillness check -----
 async function checkWorkspaceStillness(projectDir) {
   let previousSnapshot = null;
@@ -1960,10 +1991,7 @@ async function checkWorkspaceStillness(projectDir) {
   const startTime = Date.now();
 
   while (Date.now() - startTime < STILLNESS_MAX_WAIT_MS) {
-    const result = await runProcess("git", ["status", "--porcelain=v1", "-z"], {
-      cwd: projectDir, timeoutMs: 10000,
-    });
-    const snapshot = result.stdout;
+    const snapshot = await buildDeepSnapshot(projectDir);
     if (snapshot === previousSnapshot) {
       consecutiveMatches++;
       if (consecutiveMatches >= STILLNESS_REQUIRED_SNAPSHOTS) {
@@ -1976,6 +2004,46 @@ async function checkWorkspaceStillness(projectDir) {
     await new Promise((r) => setTimeout(r, STILLNESS_INTERVAL_MS));
   }
   return false;
+}
+
+// ----- build-run: resolve effective command through shell wrappers -----
+function resolveEffectiveCommand(args) {
+  if (!Array.isArray(args) || args.length === 0) return null;
+  const cmd0 = args[0].toLowerCase().split(/[/\\]/).pop();
+
+  if ((cmd0 === "cmd.exe" || cmd0 === "cmd") && args[1] === "/c") {
+    const rest = args.slice(2);
+    if (rest.length > 0) {
+      const firstToken = String(rest[0]).trim().split(/\s+/)[0].toLowerCase();
+      if (firstToken) return firstToken;
+    }
+    return "cmd";
+  }
+
+  if ((cmd0 === "powershell" || cmd0 === "pwsh") &&
+      (args[1] === "-Command" || args[1] === "-c" || args[1] === "/c")) {
+    const rest = args.slice(2);
+    if (rest.length > 0) {
+      const firstToken = String(rest[0]).trim().split(/\s+/)[0].toLowerCase();
+      if (firstToken) return firstToken;
+    }
+    return cmd0;
+  }
+
+  if ((cmd0 === "sh" || cmd0 === "bash" || cmd0 === "zsh" || cmd0 === "dash") && args[1] === "-c") {
+    const rest = args.slice(2);
+    if (rest.length > 0) {
+      const firstToken = String(rest[0]).trim().split(/\s+/)[0].toLowerCase();
+      if (firstToken) return firstToken;
+    }
+    return cmd0;
+  }
+
+  if ((cmd0 === "npx" || cmd0 === "npx.cmd") && args.length >= 2) {
+    return resolveEffectiveCommand(args.slice(1));
+  }
+
+  return cmd0;
 }
 
 // ----- build-run: contract validation -----
@@ -2069,14 +2137,15 @@ function validateContract(value) {
       });
     }
     if (!allowExternalSideEffects) {
-      const baseCmd = step.command[0].toLowerCase().split(/[/\\]/).pop();
-      if (HIGH_RISK_VERIFICATION_COMMANDS.includes(baseCmd)) {
+      const baseCmd = resolveEffectiveCommand(step.command);
+      if (baseCmd && HIGH_RISK_VERIFICATION_COMMANDS.includes(baseCmd)) {
         throw buildJsonErrorResponse({
           errorCode: "CONTRACT_SCHEMA_INVALID",
           exitCode: 2,
-          message: `Verification command '${baseCmd}' is not allowed. Set "allowExternalSideEffects": true in contract to enable it.`,
+          message: `Verification command resolves to '${baseCmd}' which is not allowed. Set "allowExternalSideEffects": true in contract to enable it.`,
           stepId: step.id,
           command: baseCmd,
+          fullCommand: step.command,
         });
       }
     }
@@ -2678,7 +2747,11 @@ async function cmdBuildRun(projectDir, tailArgs) {
           message: `Session '${contract.sessionName}' has a quarantined run (${existing.runId}). Create a new sessionName or resolve the quarantine first.`,
         });
       }
-    } catch { /* skip unreadable entries */ }
+    } catch (scanErr) {
+      if (scanErr instanceof CommandError) throw scanErr;
+      if (scanErr?.code !== "ENOENT" && !(scanErr instanceof SyntaxError)) throw scanErr;
+      // skip unreadable / corrupt run state files
+    }
   }
 
   if (contract.requireCleanWorktree) {
@@ -3015,9 +3088,11 @@ export {
   extractBuildReportFromEvents,
   killProcessTree,
   checkWorkspaceStillness,
+  buildDeepSnapshot,
   runWrapperVerification,
   buildRunArgs,
   buildSystemPrompt,
+  resolveEffectiveCommand,
   parseNdjson,
   extractFinalAssistantMessage,
   extractSessionIdFromEvents,

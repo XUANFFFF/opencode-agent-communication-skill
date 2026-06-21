@@ -23,9 +23,11 @@ import {
   extractBuildReportFromEvents,
   killProcessTree,
   checkWorkspaceStillness,
+  buildDeepSnapshot,
   runWrapperVerification,
   runProcess,
   buildSystemPrompt,
+  resolveEffectiveCommand,
   BUILD_RUN_ERROR_CODES,
   VALID_PHASES,
   HIGH_RISK_VERIFICATION_COMMANDS,
@@ -827,6 +829,179 @@ try {
   reviewBlocked = e.message.includes("SESSION_QUARANTINED");
 }
 assert(reviewBlocked, "build-review rejects non-awaiting_review phase");
+
+suite("resolveEffectiveCommand");
+
+assert(resolveEffectiveCommand(["echo", "hello"]) === "echo", "simple command");
+assert(resolveEffectiveCommand(["ssh", "user@host"]) === "ssh", "ssh directly blocked");
+assert(resolveEffectiveCommand(["cmd.exe", "/c", "vercel", "deploy"]) === "vercel", "cmd.exe /c vercel deploy");
+assert(resolveEffectiveCommand(["cmd", "/c", "ssh", "user@host"]) === "ssh", "cmd /c ssh");
+assert(resolveEffectiveCommand(["powershell", "-Command", "ssh", "user@host"]) === "ssh", "powershell -Command ssh");
+assert(resolveEffectiveCommand(["pwsh", "-c", "kubectl", "get", "pods"]) === "kubectl", "pwsh -c kubectl");
+assert(resolveEffectiveCommand(["sh", "-c", "docker", "ps"]) === "docker", "sh -c docker");
+assert(resolveEffectiveCommand(["bash", "-c", "systemctl", "restart", "nginx"]) === "systemctl", "bash -c systemctl");
+assert(resolveEffectiveCommand(["npx", "vercel", "deploy"]) === "vercel", "npx vercel deploy");
+assert(resolveEffectiveCommand(["npx.cmd", "terraform", "apply"]) === "terraform", "npx.cmd terraform");
+assert(resolveEffectiveCommand(["cmd.exe", "/c", "echo", "hello"]) === "echo", "cmd.exe /c echo allowed cmd");
+assert(resolveEffectiveCommand([]) === null, "empty args returns null");
+assert(resolveEffectiveCommand(null) === null, "null args returns null");
+
+suite("buildDeepSnapshot");
+
+const snapshotRepo = await createTempRepo();
+
+// Clean repo should produce deterministic snapshot
+const snap1 = await buildDeepSnapshot(snapshotRepo);
+const snap2 = await buildDeepSnapshot(snapshotRepo);
+assert(snap1 === snap2, "clean repo produces identical deep snapshots");
+
+// Modify a file and verify snapshot changes
+await fs.writeFile(path.join(snapshotRepo, "README.md"), "# Modified Content\n", "utf8");
+const snap3 = await buildDeepSnapshot(snapshotRepo);
+assert(snap3 !== snap1, "modified file changes deep snapshot");
+assert(snap3.includes("README.md"), "deep snapshot contains modified file path");
+assert(snap3.includes("size="), "deep snapshot contains file size");
+assert(snap3.includes("mtime="), "deep snapshot contains mtime");
+assert(snap3.includes("hash:"), "deep snapshot contains content hash");
+
+// Continuous writes must change the snapshot (size/hash/mtime change)
+const spamFile = path.join(snapshotRepo, "spam.txt");
+await fs.writeFile(spamFile, "line1\n", "utf8");
+const snapBefore = await buildDeepSnapshot(snapshotRepo);
+await new Promise(r => setTimeout(r, 100));
+// Write different content
+await fs.writeFile(spamFile, "line2\n", "utf8");
+const snapAfter = await buildDeepSnapshot(snapshotRepo);
+assert(snapBefore !== snapAfter, "continuous writes produce different snapshots");
+
+// Untracked file appears in snapshot
+assert(snapAfter.includes("spam.txt"), "deep snapshot captures untracked files");
+
+suite("Quarantine scan with real state files");
+
+const qScanDir = path.join(os.tmpdir(), "qscan-test-" + Date.now());
+await fs.mkdir(qScanDir, { recursive: true });
+const qRunId = generateRunId();
+const qState = createInitialRunState({
+  runId: qRunId, projectDir: "/tmp", sessionName: "blocked-session",
+  allowedPaths: ["src/**"], contract: {},
+});
+qState.phase = "quarantined";
+qState.quarantined = true;
+qState.opencodeResumeAllowed = false;
+await fs.writeFile(path.join(qScanDir, `${qRunId}.json`), JSON.stringify(qState), "utf8");
+
+// Simulate the quarantine scan from cmdBuildRun
+let scanBlocked = false;
+const scanContract = { sessionName: "blocked-session" };
+let scanEntries;
+try {
+  scanEntries = await fs.readdir(qScanDir);
+} catch {
+  scanEntries = [];
+}
+for (const entry of scanEntries) {
+  if (!entry.endsWith(".json")) continue;
+  try {
+    const raw = await fs.readFile(path.join(qScanDir, entry), "utf8");
+    const existing = JSON.parse(raw);
+    if (existing.sessionName === scanContract.sessionName && existing.quarantined) {
+      throw new Error("SCAN_BLOCKED");
+    }
+  } catch (scanErr) {
+    if (scanErr.message === "SCAN_BLOCKED") {
+      scanBlocked = true;
+      break;
+    }
+    // Only skip ENOENT or SyntaxError
+    if (scanErr?.code !== "ENOENT" && !(scanErr instanceof SyntaxError)) throw scanErr;
+  }
+}
+assert(scanBlocked, "real state file with quarantined run blocks same sessionName");
+
+// Create a non-quarantined run with different sessionName
+const activeRunId = generateRunId();
+const activeState = createInitialRunState({
+  runId: activeRunId, projectDir: "/tmp", sessionName: "active-session",
+  allowedPaths: ["src/**"], contract: {},
+});
+activeState.phase = "running";
+activeState.quarantined = false;
+await fs.writeFile(path.join(qScanDir, `${activeRunId}.json`), JSON.stringify(activeState), "utf8");
+
+// Corrupt file should be gracefully skipped
+const corruptFile = path.join(qScanDir, "corrupt.json");
+await fs.writeFile(corruptFile, "not valid json{{", "utf8");
+let skipCount = 0;
+let sessionsSeen = [];
+scanEntries = await fs.readdir(qScanDir);
+for (const entry of scanEntries) {
+  if (!entry.endsWith(".json")) continue;
+  try {
+    const raw = await fs.readFile(path.join(qScanDir, entry), "utf8");
+    const parsed = JSON.parse(raw);
+    sessionsSeen.push(parsed.sessionName);
+  } catch (innerErr) {
+    if (innerErr?.code !== "ENOENT" && !(innerErr instanceof SyntaxError)) throw innerErr;
+    skipCount++;
+  }
+}
+assert(skipCount >= 1, "corrupt JSON is gracefully skipped");
+assert(sessionsSeen.length === 2, "scan processes all readable files past corrupt file");
+assert(sessionsSeen.includes("blocked-session"), "quarantined session still detected after corrupt file");
+assert(sessionsSeen.includes("active-session"), "active session still detected after corrupt file");
+
+let activeNotBlocked = true;
+scanEntries = await fs.readdir(qScanDir);
+for (const entry of scanEntries) {
+  if (!entry.endsWith(".json")) continue;
+  try {
+    const raw = await fs.readFile(path.join(qScanDir, entry), "utf8");
+    const existing = JSON.parse(raw);
+    if (existing.sessionName === "active-session" && existing.quarantined) {
+      activeNotBlocked = false;
+    }
+  } catch { /* skip */ }
+}
+assert(activeNotBlocked, "non-quarantined run does not block");
+
+// Cleanup
+await fs.rm(qScanDir, { recursive: true, force: true });
+
+suite("Denylist shell wrapper detection via validateContract");
+
+assertThrows(() => validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "b1", command: ["cmd.exe", "/c", "vercel", "deploy"] }],
+  hardTimeoutMs: 60000,
+}), "CONTRACT_SCHEMA_INVALID", "cmd.exe /c vercel deploy blocked");
+
+assertThrows(() => validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "b2", command: ["powershell", "-Command", "ssh", "user@host"] }],
+  hardTimeoutMs: 60000,
+}), "CONTRACT_SCHEMA_INVALID", "powershell -Command ssh blocked");
+
+assertThrows(() => validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "b3", command: ["sh", "-c", "kubectl", "apply", "-f", "x.yaml"] }],
+  hardTimeoutMs: 60000,
+}), "CONTRACT_SCHEMA_INVALID", "sh -c kubectl blocked");
+
+assertThrows(() => validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "b4", command: ["npx", "vercel", "deploy"] }],
+  hardTimeoutMs: 60000,
+}), "CONTRACT_SCHEMA_INVALID", "npx vercel deploy blocked");
+
+// allowExternalSideEffects bypasses all shell wrapper detection
+const bypassContractShell = validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  allowExternalSideEffects: true,
+  verification: [{ id: "safe", command: ["cmd.exe", "/c", "ssh", "user@host"] }],
+  hardTimeoutMs: 60000,
+});
+assert(bypassContractShell.allowExternalSideEffects === true, "bypass works with shell wrapper");
 
 // ----- Summary -----
 suite("SUMMARY");
