@@ -850,7 +850,10 @@ assert(resolveEffectiveCommand(["npx", "--yes", "vercel", "deploy"]) === "vercel
 assert(resolveEffectiveCommand(["npx", "-y", "terraform", "apply"]) === "terraform", "npx -y terraform");
 assert(resolveEffectiveCommand(["npx", "--package", "some", "vercel"]) === "vercel", "npx --package pkg vercel");
 assert(resolveEffectiveCommand(["npx", "-p", "some", "ssh"]) === "ssh", "npx -p pkg ssh");
-assert(resolveEffectiveCommand(["npx", "--call", "terraform"]) === "npx", "npx --call consumes call string");
+assert(resolveEffectiveCommand(["npx", "--call", "terraform"]) === "terraform", "npx --call terraform call string");
+assert(resolveEffectiveCommand(["npx", "--call", "vercel deploy"]) === "vercel", "npx --call vercel deploy multi-word");
+assert(resolveEffectiveCommand(["npx", "-c", "ssh user@host"]) === "ssh", "npx -c ssh user@host");
+assert(resolveEffectiveCommand(["npx", "--call", "terraform apply"]) === "terraform", "npx --call terraform apply");
 assert(resolveEffectiveCommand(["cmd.exe", "/c", "echo", "hello"]) === "echo", "cmd.exe /c echo allowed cmd");
 assert(resolveEffectiveCommand([]) === null, "empty args returns null");
 assert(resolveEffectiveCommand(null) === null, "null args returns null");
@@ -1032,6 +1035,24 @@ assertThrows(() => validateContract({
   verification: [{ id: "b9", command: ["pwsh", "-Command", "kubectl", "get", "pods"] }],
   hardTimeoutMs: 60000,
 }), "CONTRACT_SCHEMA_INVALID", "pwsh -Command PascalCase blocked");
+
+assertThrows(() => validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "b10", command: ["npx", "--call", "vercel deploy"] }],
+  hardTimeoutMs: 60000,
+}), "CONTRACT_SCHEMA_INVALID", "npx --call vercel deploy blocked");
+
+assertThrows(() => validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "b11", command: ["npx", "-c", "ssh user@host"] }],
+  hardTimeoutMs: 60000,
+}), "CONTRACT_SCHEMA_INVALID", "npx -c ssh user@host blocked");
+
+assertThrows(() => validateContract({
+  sessionName: "t", agent: "build", allowedPaths: ["src/**"],
+  verification: [{ id: "b12", command: ["npx", "--call", "terraform apply"] }],
+  hardTimeoutMs: 60000,
+}), "CONTRACT_SCHEMA_INVALID", "npx --call terraform apply blocked");
 
 // allowExternalSideEffects bypasses all shell wrapper detection
 const bypassContractShell = validateContract({

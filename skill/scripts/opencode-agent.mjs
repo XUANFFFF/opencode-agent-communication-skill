@@ -2047,8 +2047,15 @@ function resolveEffectiveCommand(args) {
       const a = args[i];
       if (a === "--yes" || a === "-y") {
         i++;
-      } else if (a === "--package" || a === "-p" || a === "--call" || a === "-c") {
+      } else if (a === "--package" || a === "-p") {
         i += 2;
+      } else if (a === "--call" || a === "-c") {
+        const callStr = args[i + 1];
+        if (callStr) {
+          const firstToken = String(callStr).trim().split(/\s+/)[0].toLowerCase();
+          if (firstToken) return firstToken;
+        }
+        return "npx";
       } else {
         break;
       }
